@@ -11,8 +11,80 @@ BIN_DIR=$(cd $(dirname $0); pwd) # absolute path
 # parse args
 BUILD_DIR=$1
 CACHE_DIR=$2
+MAVEN_DIR=${BUILD_DIR}
 
 mkdir -p $CACHE_DIR
+
+# install JDK 
+if [ -f ${BUILD_DIR}/system.properties ]; then
+  logger -p user.notice -t "slugc[$$]" "language_pack_java download_jdk"
+  LOGGER_FLAGS="$LOGGER_FLAGS download_jdk"
+  javaVersion=$(detect_java_version ${BUILD_DIR})
+  echo -n "-----> Installing OpenJDK ${javaVersion}..."
+  install_java ${BUILD_DIR} ${javaVersion}
+  jdk_overlay ${BUILD_DIR}
+  echo "done"
+  cp ${BUILD_DIR}/system.properties ${CACHE_DIR}/
+fi
+
+# change to cache dir to install maven
+cd $CACHE_DIR
+
+# install maven with base repository
+MAVEN_URL="http://s3.amazonaws.com/heroku-jvm-langpack-java/maven.tar.gz"
+
+if [ ! -d .maven ]; then
+  echo -n "-----> Installing Maven 3.0.3..."
+  curl --silent --max-time 60 --location $MAVEN_URL | tar xz
+  chmod +x .maven/bin/mvn
+  echo " done"
+fi
+
+cd $BUILD_DIR
+
+MAVEN_SETTINGS_URL="http://s3.amazonaws.com/heroku-jvm-langpack-java/settings.xml"
+
+echo -n "-----> Installing settings.xml..."
+# if the project contains a 'settings.xml' use that instead of the heroku default
+if [ -f settings.xml ]; then
+    MAVEN_SETTINGS_FILE=$BUILD_DIR/settings.xml
+else
+    if [ -f .m2/settings.xml ]; then
+      rm .m2/settings.xml
+    fi
+    curl --silent --max-time 10 --location $MAVEN_SETTINGS_URL --output .m2/settings.xml
+    MAVEN_SETTINGS_FILE=$CACHE_DIR/.m2/settings.xml
+fi
+echo " done"
+
+# change to build dir to run maven
+cd $MAVEN_DIR
+
+export MAVEN_OPTS="-Xmx512m"
+
+# build app
+BUILDCMD="$CACHE_DIR/.maven/bin/mvn -B -Duser.home=$BUILD_DIR -Dmaven.repo.local=$CACHE_DIR/.m2/repository -s $MAVEN_SETTINGS_FILE -DskipTests=true clean install"
+
+echo "-----> executing $BUILDCMD"
+
+$BUILDCMD 2>&1 | sed -u 's/^/       /'
+
+if [ "${PIPESTATUS[*]}" != "0 0" ]; then
+  echo " !     Failed to build app with Maven"
+  exit 1
+fi
+
+# finalize cache
+if [ "false" == $KEEP_M2_CACHE ]; then
+  touch $CACHE_DIR/removeM2Cache
+fi
+
+#copy .m2 and .maven if needed
+if [ "true" == $KEEP_M2_CACHE ]; then
+  for DIR in ".m2" ".maven" ; do
+    cp -r $CACHE_DIR/$DIR $DIR
+  done
+fi
 
 function indent() {
   c='s/^/       /'
@@ -21,6 +93,8 @@ function indent() {
     *)      sed -u "$c";;
   esac
 }
+
+cd $BUILD_DIR
 
 # BUILD_DIR is (during this stage) a temporary directory. During execution
 # of your slug it'll be known as '/app'.
